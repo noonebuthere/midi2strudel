@@ -1,0 +1,5 @@
+/home/fabian/files/Source/Rust/midi2strudel/target/debug/deps/midi2strudel-e0ccf4ee24e4ee19.d: src/main.rs
+
+/home/fabian/files/Source/Rust/midi2strudel/target/debug/deps/midi2strudel-e0ccf4ee24e4ee19: src/main.rs
+
+src/main.rs:
