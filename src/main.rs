@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Add;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -318,7 +319,6 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
     })
 }
 
-
 // interval partitioning problem, apparently
 // reference: https://www.youtube.com/watch?v=i_G8hZYcKnI
 fn assign_lanes(mut notes: Vec<NoteEvent>) -> Vec<Vec<NoteEvent>> {
@@ -383,14 +383,15 @@ fn parse_midi(mut data: Vec<u8>) -> Result<(HeaderData, Vec<QuantizedTrack>), St
 
     let mut laned_tracks = Vec::new();
     for track in tracks {
-        println!("{:?}", track);
-        let (smallest_division, note_events) = events_to_notes(track.events);
+        let (smallest_division, tempo, note_events) = events_to_notes(track.events);
         let lanes = assign_lanes(note_events);
-        let (speed_mod, quantized_lanes) = quantize_lanes(lanes, smallest_division, hdr_data.division as u32);
+        let (speed_mod, quantized_lanes) =
+            quantize_lanes(lanes, smallest_division, hdr_data.division as u32);
         laned_tracks.push(QuantizedTrack {
             lanes: quantized_lanes,
             name: track.name,
             speed_mod,
+            tempo,
         });
     }
 
@@ -401,13 +402,17 @@ fn parse_midi(mut data: Vec<u8>) -> Result<(HeaderData, Vec<QuantizedTrack>), St
 enum QuantizedNote {
     Note(u8),
     Rest,
-    Hold
+    Hold,
 }
 
-fn quantize_lanes(lanes: Vec<Vec<NoteEvent>>, smallest_division: u32, hdr_division: u32) -> (u32, Vec<Vec<QuantizedNote>>) {
+fn quantize_lanes(
+    lanes: Vec<Vec<NoteEvent>>,
+    smallest_division: u32,
+    hdr_division: u32,
+) -> (u32, Vec<Vec<QuantizedNote>>) {
     let speed_mod = hdr_division.div_ceil(smallest_division);
     let mut quantized_lanes = Vec::new();
-    
+
     for lane in lanes {
         let mut max_end_tick = 0;
         for note in &lane {
@@ -415,13 +420,13 @@ fn quantize_lanes(lanes: Vec<Vec<NoteEvent>>, smallest_division: u32, hdr_divisi
         }
         let total_steps = max_end_tick.div_ceil(smallest_division) as usize;
         let mut steps = vec![QuantizedNote::Rest; total_steps];
-        
+
         for note in lane {
             let start_step = note.start.div_ceil(smallest_division) as usize;
             let duration_steps = note.duration.div_ceil(smallest_division) as usize;
-            
+
             steps[start_step] = QuantizedNote::Note(note.pitch);
-            
+
             for i in 1..duration_steps {
                 let idx = start_step + i;
                 if idx < total_steps {
@@ -431,7 +436,7 @@ fn quantize_lanes(lanes: Vec<Vec<NoteEvent>>, smallest_division: u32, hdr_divisi
         }
         quantized_lanes.push(steps);
     }
-    
+
     (speed_mod, quantized_lanes)
 }
 
@@ -440,6 +445,8 @@ struct QuantizedTrack {
     lanes: Vec<Vec<QuantizedNote>>,
     name: String,
     speed_mod: u32,
+    /// in microseconds per quarter note
+    tempo: Option<u32>,
 }
 
 fn main() {
@@ -465,22 +472,56 @@ fn main() {
         eprintln!("Error while parsing midi: {}", e);
         std::process::exit(1);
     }
-    let (header, tracks) = parsed.unwrap();
-    println!("HEADER:\n{:#?}\n", header);
-    println!("TRACKS:\n{:#?}", tracks);
+    let (_, tracks) = parsed.unwrap();
+    
+    let mut code = String::new();
+    let mut tempo = 120; // midi default tempo
     for track in tracks {
-        codegen_track(track);
+        if let Some(t) = track.tempo {
+            tempo = t;
+        }
+        code.push_str(codegen_track(track).as_str());
     }
+    code.insert_str(0, format!("setcpm({})\n\n", ( 1_000_000.0 * 60.0 * 4.0 / tempo as f32).round()).as_str());
+    
+    println!("{}", code);
 }
 
 fn codegen_track(track: QuantizedTrack) -> String {
-    let code = String::new();
-    
+    let mut lane_reprs = Vec::new();
     for lane in track.lanes {
-        let lane = String::new();
+        let mut lane_repr = lane
+            .iter()
+            .map(|n| match *n {
+                QuantizedNote::Hold => "_".to_string(),
+                QuantizedNote::Note(n) => format!("{}", n),
+                QuantizedNote::Rest => "-".to_string(),
+            })
+            .collect::<Vec<String>>()
+            .join(" ");
+        lane_repr.insert(0, '<');
+        lane_repr.push('>');
+
+        let split_amt = 120;
+        let mut new_lane_repr = String::new();
+        for (i, c) in lane_repr.chars().enumerate() {
+            if i != 0 && i % split_amt == 0 {
+                new_lane_repr.push('\n');
+            }
+            new_lane_repr.push(c);
+        }
         
+        lane_reprs.push(new_lane_repr);
     }
-    
+
+    let mut code = format!(
+        "${}: note(`\n  ",
+        track
+            .name
+            .replace(|c: char| { !c.is_ascii_alphanumeric() }, "")
+    );
+    code.push_str(lane_reprs.join(",\n  ").as_str());
+    code.push_str("\n`).sound(\"<TODO>\")\n\n");
     code
 }
 
@@ -496,11 +537,12 @@ struct NoteEvent {
     start: u32,
     duration: u32,
 }
-fn events_to_notes(track: Vec<Event>) -> (u32, Vec<NoteEvent>) {
+fn events_to_notes(track: Vec<Event>) -> (u32, Option<u32>, Vec<NoteEvent>) {
     let mut time = 0;
     let mut lowest_duration = u32::MAX;
     let mut lane = Vec::new();
     let mut pending_notes: HashMap<u8, Vec<u32>> = HashMap::new();
+    let mut tempo = None;
     for event in track {
         time += event.deltatime;
         match event.tp {
@@ -512,9 +554,8 @@ fn events_to_notes(track: Vec<Event>) -> (u32, Vec<NoteEvent>) {
                 eprintln!("Warning: SetKeySig Event not yet implemented, ignoring.");
                 continue;
             }
-            EventType::SetTempo(_) => {
-                eprintln!("Warning: SetTempo Event not yet implemented, ignoring.");
-                continue;
+            EventType::SetTempo(n) => {
+                tempo = Some(n);
             }
             EventType::MidiOn(note) => {
                 let handle = pending_notes.get_mut(&note);
@@ -564,5 +605,5 @@ fn events_to_notes(track: Vec<Event>) -> (u32, Vec<NoteEvent>) {
         }
     }
 
-    (lowest_duration, lane)
+    (lowest_duration, tempo, lane)
 }
