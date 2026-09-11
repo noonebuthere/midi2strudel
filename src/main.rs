@@ -1,3 +1,9 @@
+// (c) 2026 noonebuthere
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -7,6 +13,18 @@ struct Chunk {
     len: u32,
     /// Pop to get next byte
     data: Vec<u8>,
+}
+
+fn read_vlq(data: &mut Vec<u8>) -> u32 {
+    let mut v: u32 = 0;
+
+    loop {
+        let b = data.pop().unwrap();
+        v = (v << 7) | (b as u32 & 0b01111111);
+        if b & (0x80) == 0 {
+            break v;
+        }
+    }
 }
 
 fn parse_chunks(mut data: Vec<u8>) -> Result<Vec<Chunk>, String> {
@@ -99,19 +117,7 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
     let mut running_status: Option<u8> = None;
 
     while !chunk.data.is_empty() {
-        // parse deltatime
-        let mut dt: u32 = 0;
-        loop {
-            let b = chunk.data.pop().unwrap();
-            dt += (b & 0b01111111) as u32;
-            // while bit 7 is set
-            if b & 0b10000000 == 0x80 {
-                dt <<= 7;
-            } else {
-                // bit 7 is unset
-                break;
-            }
-        }
+        let dt = read_vlq(&mut chunk.data);
 
         let peeked = *chunk.data.last().unwrap();
         let event_id = if peeked & 0x80 != 0 {
@@ -132,7 +138,7 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
                 }
                 0x01..0x0F => {
                     // some kind of text event
-                    let len = chunk.data.pop().unwrap();
+                    let len = read_vlq(&mut chunk.data);
                     for _ in 0..len {
                         let ch = chunk.data.pop().unwrap();
                         track_name.push(ch as char);
@@ -202,20 +208,21 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
                 }
                 0x7F => {
                     // sequencer specific meta event
-                    let len = chunk.data.pop().unwrap();
+                    let len = read_vlq(&mut chunk.data);
                     for _ in 0..len {
                         let _ = chunk.data.pop().unwrap();
                     }
                 }
                 x => {
-                    let len = chunk.data.pop().unwrap();
-                    // TODO: parse vlq
+                    let len = read_vlq(&mut chunk.data);
                     for _ in 0..len {
                         let _ = chunk.data.pop().unwrap();
                     }
                     eprintln!("Warning: invalid event 0xFF {:#x} encountered, ignored", x)
                 }
             }
+
+            continue;
         }
 
         let upper = (event_id & 0b11110000) >> 4;
@@ -370,9 +377,30 @@ fn assign_lanes(mut notes: Vec<NoteEvent>) -> Vec<Vec<NoteEvent>> {
     lanes
 }
 
-fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 { a } else { gcd(b, a % b) }
+// START AI
+// Claude wrote this method after I told it I need a quantization based on approximate note
+// positions, not the exact ticks
+
+const CANDIDATE_DIVISIONS: &[u32] = &[1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+
+fn find_best_subdivision(division: u32, ticks: &[u32], tolerance: u32) -> u32 {
+    for &d in CANDIDATE_DIVISIONS {
+        let step_ticks = division as f64 / d as f64;
+        if step_ticks < 1.0 {
+            break;
+        }
+        let fits = ticks.iter().all(|&t| {
+            let nearest = (t as f64 / step_ticks).round() * step_ticks;
+            (t as f64 - nearest).abs() <= tolerance as f64
+        });
+        if fits {
+            return d;
+        }
+    }
+    *CANDIDATE_DIVISIONS.last().unwrap()
 }
+
+// END AI
 
 fn parse_midi(
     mut data: Vec<u8>,
@@ -408,7 +436,8 @@ fn parse_midi(
     }
 
     // BEGIN AI
-    
+    // Used Claude to refactor this to use find_best_subdivision instead of gcd
+
     let mut converted: Vec<(String, Option<u32>, Vec<NoteEvent>)> = Vec::new();
     let mut all_ticks: Vec<u32> = Vec::new();
 
@@ -431,13 +460,25 @@ fn parse_midi(
     let mut laned_tracks = Vec::new();
     for (name, tempo, note_events) in converted {
         let lanes = assign_lanes(note_events);
-        let (speed_mod, quantized_lanes) =
+        let (speed_mod, mut quantized_lanes) =
             quantize_lanes(lanes, global_division, hdr_data.division as u32, opt_level);
+        let max_len = quantized_lanes.iter().map(|l| l.len()).max().unwrap_or(0);
+        for lane in &mut quantized_lanes {
+            while lane.len() < max_len {
+                lane.push(QuantizedNote::new(QuantizedNoteType::Rest));
+            }
+        }
+        let cycles = if speed_mod == 0 {
+            0.0
+        } else {
+            max_len as f64 / speed_mod as f64
+        };
         laned_tracks.push(QuantizedTrack {
             lanes: quantized_lanes,
             name,
             speed_mod,
             tempo,
+            cycles,
         });
     }
 
@@ -493,12 +534,15 @@ fn quantize_lanes(
     let round_div =
         |ticks: u32, div: u32| -> usize { (ticks as f64 / div as f64).round() as usize };
 
-    for lane in lanes {
-        let mut max_end_tick = 0;
-        for note in &lane {
+    let mut max_end_tick = 0;
+    for lane in &lanes {
+        for note in lane {
             max_end_tick = max_end_tick.max(note.start + note.duration);
         }
-        let total_steps = round_div(max_end_tick, smallest_division).max(1);
+    }
+    let total_steps = round_div(max_end_tick, smallest_division).max(1);
+
+    for lane in lanes {
         let mut steps = vec![QuantizedNote::new(QuantizedNoteType::Rest); total_steps];
 
         for note in lane {
@@ -522,12 +566,10 @@ fn quantize_lanes(
                     new_steps.push(step);
                     continue;
                 }
-
                 if let QuantizedNoteType::Note(_) = step.tp {
                     new_steps.push(step);
                     continue;
                 }
-
                 for idx in (0..i).rev() {
                     if new_steps[idx].tp == step.tp {
                         new_steps[idx].len += 1;
@@ -557,6 +599,7 @@ struct QuantizedTrack {
     speed_mod: u32,
     /// in microseconds per quarter note
     tempo: Option<u32>,
+    cycles: f64,
 }
 
 fn main() {
@@ -582,7 +625,7 @@ fn main() {
         }
     }
 
-    let data = match std::fs::read(path) {
+    let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Error while reading file: {}", e);
@@ -596,10 +639,7 @@ fn main() {
     }
     let (header, tracks) = parsed.unwrap();
 
-    let mut code = format!(
-        "// generated by midi2strudel\n// track count: {}\n\n",
-        header.ntrks
-    );
+    let mut code = String::new();
     let mut tempo = 500_000; // midi default tempo 120bpm
     for track in tracks {
         if let Some(t) = track.tempo {
@@ -610,13 +650,14 @@ fn main() {
     code.insert_str(
         0,
         format!(
-            "setcpm({})\n\n",
-            (1_000_000.0 * 60.0 * 4.0 / tempo as f32).round()
+            "// generated by midi2strudel\n// track count: {}\n\nsetcpm({})\n\n",
+            header.ntrks,
+            (1_000_000.0 * 60.0 / tempo as f32).round()
         )
         .as_str(),
     );
 
-    println!("{}", code);
+    std::fs::write(path.with_file_name("midi2strudel.js"), code).unwrap();
 }
 
 fn codegen_track(track: QuantizedTrack) -> String {
@@ -624,32 +665,29 @@ fn codegen_track(track: QuantizedTrack) -> String {
     for lane in track.lanes {
         let mut lane_repr = lane
             .iter()
-            .fold(String::new(), |acc, x| {
-                if acc.is_empty() {
-                    x.repr()
+            .fold((0, String::new()), |acc, x| {
+                if acc.1.is_empty() {
+                    (acc.0 + 1, x.repr())
                 } else if x.repr().is_empty() {
-                    acc
+                    (acc.0, acc.1)
                 } else {
-                    acc + " " + &x.repr()
+                    if acc.0 % 40 == 0 && acc.0 > 0 {
+                        (acc.0 + 1, acc.1 + " " + &x.repr() + "\n")
+                    } else {
+                        (acc.0 + 1, acc.1 + " " + &x.repr())
+                    }
                 }
-            });
+            })
+            .1;
         lane_repr.insert(0, '<');
-        lane_repr.push_str(format!(">*{}", track.speed_mod).as_str());
+        lane_repr.push_str(format!(" -@999999>*{}", track.speed_mod).as_str());
 
-        let split_amt = 120;
-        let mut new_lane_repr = String::new();
-        for (i, c) in lane_repr.chars().enumerate() {
-            if i != 0 && i % split_amt == 0 {
-                new_lane_repr.push('\n');
-            }
-            new_lane_repr.push(c);
-        }
-
-        lane_reprs.push(new_lane_repr);
+        lane_reprs.push(lane_repr);
     }
 
     let mut code = format!(
-        "${}: note(`\n  ",
+        "// cycle count: {}\n${}: note(`\n  ",
+        track.cycles,
         track
             .name
             .replace(|c: char| { !c.is_ascii_alphanumeric() }, "")
