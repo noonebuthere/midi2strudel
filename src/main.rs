@@ -1,17 +1,5 @@
-use crate::EventType::SetTimeSig;
+use std::collections::HashMap;
 use std::path::PathBuf;
-
-fn num_to_vlq(mut num: u32) -> Vec<u8> {
-    let mut res = Vec::new();
-    res.push((num & 0b01111111) as u8);
-    num >>= 7;
-    while num > 0 {
-        res.push((num & 0b01111111) as u8 | 0b10000000);
-        num >>= 7;
-    }
-    res.reverse();
-    res
-}
 
 #[derive(Debug)]
 struct Chunk {
@@ -109,7 +97,8 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
     while !chunk.data.is_empty() {
         // parse deltatime
         let mut dt: u32 = 0;
-        while let b = chunk.data.pop().unwrap() {
+        loop {
+            let b = chunk.data.pop().unwrap();
             dt += (b & 0b01111111) as u32;
             // while bit 7 is set
             if b & 0b10000000 == 0x80 {
@@ -184,7 +173,7 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
                     let bb = chunk.data.pop().unwrap();
                     events.push(Event {
                         deltatime: dt,
-                        tp: SetTimeSig(nn, dd, cc, bb),
+                        tp: EventType::SetTimeSig(nn, dd, cc, bb),
                     });
                 }
                 0x59 => 'mtch: {
@@ -329,17 +318,54 @@ fn process_chunk(mut chunk: Chunk) -> ChunkProcessingResult {
     })
 }
 
-fn parse_midi(mut data: Vec<u8>) -> Result<(HeaderData, Vec<Track>), String> {
+
+// interval partitioning problem, apparently
+// reference: https://www.youtube.com/watch?v=i_G8hZYcKnI
+fn assign_lanes(mut notes: Vec<NoteEvent>) -> Vec<Vec<NoteEvent>> {
+    notes.sort_by_key(|event| event.start);
+
+    let mut lanes: Vec<Vec<NoteEvent>> = Vec::new();
+    let mut lanes_end: Vec<u32> = Vec::new();
+
+    for note in notes {
+        let mut best_lane = None;
+        let mut best_end = None;
+
+        for (i, lane) in lanes.iter().enumerate() {
+            let lane_end = lanes_end[i];
+            if lane_end <= note.start && (best_end.is_none() || lane_end > best_end.unwrap()) {
+                best_lane = Some(i);
+                best_end = Some(lane_end);
+            }
+        }
+        if best_lane == None {
+            lanes.push(Vec::new());
+            lanes_end.push(0);
+            best_lane = Some(lanes.len() - 1);
+        }
+
+        lanes_end[best_lane.unwrap()] = note.start + note.duration;
+        lanes.get_mut(best_lane.unwrap()).unwrap().push(note);
+    }
+
+    lanes
+}
+
+fn parse_midi(mut data: Vec<u8>) -> Result<(HeaderData, Vec<QuantizedTrack>), String> {
     data.reverse();
     let chunks = parse_chunks(data)?;
     if chunks.len() < 2 {
-        return Err("Midi is not valid.".to_string());
+        return Err("Midi is not valid - invalid chunk count.".to_string());
     }
     let mut chunks = chunks.into_iter();
     let hdr_data = process_header_chunk(&chunks.next().unwrap())?;
 
     if hdr_data.format == 2 {
         eprintln!("midi2strudel does not support format 2 midi files, sorry!");
+        std::process::exit(1);
+    }
+    if hdr_data.format > 2 {
+        eprintln!("Midi is not valid - invalid format.");
         std::process::exit(1);
     }
 
@@ -354,7 +380,66 @@ fn parse_midi(mut data: Vec<u8>) -> Result<(HeaderData, Vec<Track>), String> {
             }
         }
     }
-    Ok((hdr_data, tracks))
+
+    let mut laned_tracks = Vec::new();
+    for track in tracks {
+        println!("{:?}", track);
+        let (smallest_division, note_events) = events_to_notes(track.events);
+        let lanes = assign_lanes(note_events);
+        let (speed_mod, quantized_lanes) = quantize_lanes(lanes, smallest_division, hdr_data.division as u32);
+        laned_tracks.push(QuantizedTrack {
+            lanes: quantized_lanes,
+            name: track.name,
+            speed_mod,
+        });
+    }
+
+    Ok((hdr_data, laned_tracks))
+}
+
+#[derive(Clone, Debug)]
+enum QuantizedNote {
+    Note(u8),
+    Rest,
+    Hold
+}
+
+fn quantize_lanes(lanes: Vec<Vec<NoteEvent>>, smallest_division: u32, hdr_division: u32) -> (u32, Vec<Vec<QuantizedNote>>) {
+    let speed_mod = hdr_division.div_ceil(smallest_division);
+    let mut quantized_lanes = Vec::new();
+    
+    for lane in lanes {
+        let mut max_end_tick = 0;
+        for note in &lane {
+            max_end_tick = max_end_tick.max(note.start + note.duration);
+        }
+        let total_steps = max_end_tick.div_ceil(smallest_division) as usize;
+        let mut steps = vec![QuantizedNote::Rest; total_steps];
+        
+        for note in lane {
+            let start_step = note.start.div_ceil(smallest_division) as usize;
+            let duration_steps = note.duration.div_ceil(smallest_division) as usize;
+            
+            steps[start_step] = QuantizedNote::Note(note.pitch);
+            
+            for i in 1..duration_steps {
+                let idx = start_step + i;
+                if idx < total_steps {
+                    steps[idx] = QuantizedNote::Hold;
+                }
+            }
+        }
+        quantized_lanes.push(steps);
+    }
+    
+    (speed_mod, quantized_lanes)
+}
+
+#[derive(Debug)]
+struct QuantizedTrack {
+    lanes: Vec<Vec<QuantizedNote>>,
+    name: String,
+    speed_mod: u32,
 }
 
 fn main() {
@@ -375,25 +460,109 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let midi = parse_midi(data);
-    println!("{:?}", midi);
+    let parsed = parse_midi(data);
+    if let Err(e) = parsed {
+        eprintln!("Error while parsing midi: {}", e);
+        std::process::exit(1);
+    }
+    let (header, tracks) = parsed.unwrap();
+    println!("HEADER:\n{:#?}\n", header);
+    println!("TRACKS:\n{:#?}", tracks);
+    for track in tracks {
+        codegen_track(track);
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_vlq_encoding() {
-        assert_eq!(num_to_vlq(0), vec![0]);
-        assert_eq!(num_to_vlq(0x40), vec![0x40]);
-        assert_eq!(num_to_vlq(0x7F), vec![0x7F]);
-        assert_eq!(num_to_vlq(0x80), vec![0x81, 0x00]);
-        assert_eq!(num_to_vlq(0x2000), vec![0xC0, 0x00]);
-        assert_eq!(num_to_vlq(0x3FFF), vec![0xFF, 0x7F]);
-        assert_eq!(num_to_vlq(0x4000), vec![0x81, 0x80, 0x00]);
-        assert_eq!(num_to_vlq(0x001FFFFF), vec![0xFF, 0xFF, 0x7F]);
-        assert_eq!(num_to_vlq(0x08000000), vec![0xC0, 0x80, 0x80, 0x00]);
-        assert_eq!(num_to_vlq(0x0FFFFFFF), vec![0xFF, 0xFF, 0xFF, 0x7F]);
+fn codegen_track(track: QuantizedTrack) -> String {
+    let code = String::new();
+    
+    for lane in track.lanes {
+        let lane = String::new();
+        
     }
+    
+    code
+}
+
+#[derive(Debug)]
+struct RawLane {
+    notes: Vec<NoteEvent>,
+    name: String,
+}
+
+#[derive(Debug)]
+struct NoteEvent {
+    pitch: u8,
+    start: u32,
+    duration: u32,
+}
+fn events_to_notes(track: Vec<Event>) -> (u32, Vec<NoteEvent>) {
+    let mut time = 0;
+    let mut lowest_duration = u32::MAX;
+    let mut lane = Vec::new();
+    let mut pending_notes: HashMap<u8, Vec<u32>> = HashMap::new();
+    for event in track {
+        time += event.deltatime;
+        match event.tp {
+            EventType::SetTimeSig(_, _, _, _) => {
+                eprintln!("Warning: SetTimeSig Event not yet implemented, ignoring.");
+                continue;
+            }
+            EventType::SetKeySig(_, _) => {
+                eprintln!("Warning: SetKeySig Event not yet implemented, ignoring.");
+                continue;
+            }
+            EventType::SetTempo(_) => {
+                eprintln!("Warning: SetTempo Event not yet implemented, ignoring.");
+                continue;
+            }
+            EventType::MidiOn(note) => {
+                let handle = pending_notes.get_mut(&note);
+                match handle {
+                    Some(v) => v.push(time),
+                    None => {
+                        let _ = pending_notes.insert(note, vec![time]);
+                    }
+                }
+            }
+            EventType::MidiOff(note) => {
+                if !pending_notes.contains_key(&note)
+                    || pending_notes.get(&note).unwrap().is_empty()
+                {
+                    eprintln!(
+                        "Warning: Malformed midi file (Note OFF without matching ON), ignoring."
+                    );
+                    continue;
+                }
+                let start = pending_notes.get_mut(&note).unwrap().pop().unwrap();
+                let duration = time - start;
+                if duration < lowest_duration {
+                    lowest_duration = duration;
+                }
+                lane.push(NoteEvent {
+                    pitch: note,
+                    start,
+                    duration,
+                })
+            }
+        }
+    }
+
+    for (k, v) in pending_notes {
+        if !v.is_empty() {
+            for t in v {
+                eprintln!(
+                    "Warning: Malformed midi file (Note {}:{} ON without matching OFF), assuming implied OFF.",
+                    k, t
+                );
+                lane.push(NoteEvent {
+                    pitch: k,
+                    start: t,
+                    duration: time - t,
+                })
+            }
+        }
+    }
+
+    (lowest_duration, lane)
 }
